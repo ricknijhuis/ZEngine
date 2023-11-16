@@ -15,7 +15,7 @@ pub fn build(b: *std.Build) void {
     // set a preferred release mode, allowing the user to decide how to optimize.
     const optimize = b.standardOptimizeOption(.{});
 
-    const module = b.addModule("z_engine", .{ .source_file = .{ .path = "src/main.zig" } });
+    const module = b.addModule("zengine", .{ .source_file = .{ .path = "src/main.zig" } });
     _ = module;
 
     // Creates a step for unit testing. This only builds the test executable
