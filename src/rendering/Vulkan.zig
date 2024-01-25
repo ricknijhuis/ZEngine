@@ -1,23 +1,28 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const algorithms = @import("../algorithms/find.zig");
-const engine = @import("../root.zig");
 const vulkan = @import("../platform/vulkan.zig").vulkan;
 const c = vulkan.c;
 
-const Application = engine.Application;
-const Window = engine.Window;
+const Application = @import("../Application.zig");
+const Window = @import("../platform/window.zig").Window;
 
 pub const InitParams = struct {
     allocator: std.mem.Allocator,
     application: *Application,
     window: *Window,
+    inflight_count: u32,
 };
 
 const Self = @This();
 var framenumber: u32 = 0;
 
+framebuffer_width: u32,
+framebuffer_height: u32,
+
+in_flight_frame_count: u32,
+
 allocator: std.mem.Allocator,
+
 instance: c.VkInstance = undefined,
 surface: c.VkSurfaceKHR = undefined,
 device: c.VkDevice = undefined,
@@ -30,6 +35,7 @@ physical_device_surface_format: u32 = 0,
 physical_device_surface_capabilities: c.VkSurfaceCapabilitiesKHR = undefined,
 physical_device_present_modes: []c.VkPresentModeKHR = undefined,
 physical_device_present_mode: u32 = 0,
+
 graphics_queue: c.VkQueue = undefined,
 graphics_queue_index: u32 = undefined,
 present_queue: c.VkQueue = undefined,
@@ -38,24 +44,30 @@ transfer_queue: c.VkQueue = undefined,
 transfer_queue_index: u32 = undefined,
 compute_queue: c.VkQueue = undefined,
 compute_queue_index: u32 = undefined,
+
 extend: c.VkExtent2D = undefined,
 swapchain: c.VkSwapchainKHR = undefined,
 swapchain_images: []c.VkImage = undefined,
 swapchain_image_views: []c.VkImageView = undefined,
 framebuffers: []c.VkFramebuffer = undefined,
 command_pool: c.VkCommandPool = undefined,
-command_buffer: c.VkCommandBuffer = undefined,
+command_buffers: []c.VkCommandBuffer = undefined,
 render_pass: c.VkRenderPass = undefined,
-fence: c.VkFence = undefined,
-render_semaphore: c.VkSemaphore = undefined,
-present_semaphore: c.VkSemaphore = undefined,
+fences: []c.VkFence = undefined,
+render_semaphores: []c.VkSemaphore = undefined,
+present_semaphores: []c.VkSemaphore = undefined,
 vertex_shader: c.VkShaderModule = undefined,
 fragment_shader: c.VkShaderModule = undefined,
+pipeline_layout: c.VkPipelineLayout = undefined,
+pipeline: c.VkPipeline = undefined,
 debug_msgr: c.VkDebugUtilsMessengerEXT = undefined,
 
 pub fn init(params: InitParams) !Self {
     var self = Self{
         .allocator = params.allocator,
+        .in_flight_frame_count = params.inflight_count,
+        .framebuffer_width = params.window.width,
+        .framebuffer_height = params.window.height,
     };
 
     try self.initVkInstance(params);
@@ -63,18 +75,159 @@ pub fn init(params: InitParams) !Self {
     try self.initVkSurface(params);
     try self.initVkPhysicalDevice();
     try self.initVkLogicalDevice();
-    try self.initVkSwapChain(params);
+    try self.initVkSwapChain();
     try self.initVkImageViews();
+    try self.initVkRenderPass();
+    try self.initVkShaderModule("zig-out/bin/triangle.vert.spv", &self.vertex_shader);
+    try self.initVkShaderModule("zig-out/bin/triangle.frag.spv", &self.fragment_shader);
+    try self.initVkPipeline();
     try self.initVkCommandPool();
     try self.initVkCommandBuffer();
-    try self.initVkRenderPass();
     try self.initVkFrameBuffers();
-    try self.initVkFence();
-    try self.initVkSemaphores();
-    try self.initVkShaderModule("triangle.vert.spv", &self.vertex_shader);
-    try self.initVkShaderModule("triangle.frag.spv", &self.fragment_shader);
+    try self.initVkSemaphoresAndFences();
 
     return self;
+}
+
+fn recreateSwapChain(self: *Self) !void {
+    try checkResult(c.vkDeviceWaitIdle(self.device));
+    try self.initVkSwapChain();
+    try self.initVkImageViews();
+    try self.initVkFrameBuffers();
+}
+
+fn deinitVkSwapchain(self: Self) void {
+    for (self.framebuffers) |framebuffer| {
+        c.vkDestroyFramebuffer(self.device, framebuffer, null);
+    }
+    self.allocator.free(self.framebuffers);
+
+    for (self.swapchain_image_views) |image_view| {
+        c.vkDestroyImageView(self.device, image_view, null);
+    }
+    self.allocator.free(self.swapchain_image_views);
+
+    c.vkDestroySwapchainKHR(self.device, self.swapchain, null);
+}
+
+fn initVkPipeline(self: *Self) !void {
+    const shader_stages_create_info = [_]c.VkPipelineShaderStageCreateInfo{
+        c.VkPipelineShaderStageCreateInfo{
+            .sType = c.VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            .stage = c.VK_SHADER_STAGE_VERTEX_BIT,
+            .module = self.vertex_shader,
+            .pName = "main",
+        },
+        c.VkPipelineShaderStageCreateInfo{
+            .sType = c.VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            .stage = c.VK_SHADER_STAGE_FRAGMENT_BIT,
+            .module = self.fragment_shader,
+            .pName = "main",
+        },
+    };
+
+    const dynamic_states = [_]c.VkDynamicState{
+        c.VK_DYNAMIC_STATE_VIEWPORT,
+        c.VK_DYNAMIC_STATE_SCISSOR,
+    };
+
+    const dynamic_state_create_info = c.VkPipelineDynamicStateCreateInfo{
+        .sType = c.VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+        .dynamicStateCount = dynamic_states.len,
+        .pDynamicStates = &dynamic_states[0],
+    };
+
+    const vertex_input_create_info = c.VkPipelineVertexInputStateCreateInfo{
+        .sType = c.VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+        .vertexBindingDescriptionCount = 0,
+        .pVertexBindingDescriptions = null,
+        .vertexAttributeDescriptionCount = 0,
+        .pVertexAttributeDescriptions = null,
+    };
+
+    const input_assembly_create_info = c.VkPipelineInputAssemblyStateCreateInfo{
+        .sType = c.VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+        .topology = c.VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+        .primitiveRestartEnable = c.VK_FALSE,
+    };
+
+    const viewport_state_create_info = c.VkPipelineViewportStateCreateInfo{
+        .sType = c.VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+        .viewportCount = 1,
+        .scissorCount = 1,
+    };
+
+    const rasterizer_create_info = c.VkPipelineRasterizationStateCreateInfo{
+        .sType = c.VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+        .depthClampEnable = c.VK_FALSE,
+        .polygonMode = c.VK_POLYGON_MODE_FILL,
+        .lineWidth = 1.0,
+        .cullMode = c.VK_CULL_MODE_BACK_BIT,
+        .frontFace = c.VK_FRONT_FACE_CLOCKWISE,
+        .depthBiasEnable = c.VK_FALSE,
+        .depthBiasConstantFactor = 0.0,
+        .depthBiasClamp = 0.0,
+        .depthBiasSlopeFactor = 0.0,
+    };
+
+    const multisampling_create_info = c.VkPipelineMultisampleStateCreateInfo{
+        .sType = c.VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+        .sampleShadingEnable = c.VK_FALSE,
+        .rasterizationSamples = c.VK_SAMPLE_COUNT_1_BIT,
+    };
+
+    const color_blend_attachment = c.VkPipelineColorBlendAttachmentState{
+        .colorWriteMask = c.VK_COLOR_COMPONENT_R_BIT | c.VK_COLOR_COMPONENT_G_BIT | c.VK_COLOR_COMPONENT_B_BIT | c.VK_COLOR_COMPONENT_A_BIT,
+        .blendEnable = c.VK_FALSE,
+        .srcColorBlendFactor = c.VK_BLEND_FACTOR_ONE,
+        .dstColorBlendFactor = c.VK_BLEND_FACTOR_ZERO,
+        .colorBlendOp = c.VK_BLEND_OP_ADD,
+        .srcAlphaBlendFactor = c.VK_BLEND_FACTOR_ONE,
+        .dstAlphaBlendFactor = c.VK_BLEND_FACTOR_ZERO,
+        .alphaBlendOp = c.VK_BLEND_OP_ADD,
+    };
+
+    const color_blend_create_info = c.VkPipelineColorBlendStateCreateInfo{
+        .sType = c.VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+        .logicOpEnable = c.VK_FALSE,
+        .logicOp = c.VK_LOGIC_OP_COPY,
+        .attachmentCount = 1,
+        .pAttachments = &color_blend_attachment,
+    };
+
+    const pipeline_layout_create_info = c.VkPipelineLayoutCreateInfo{
+        .sType = c.VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+    };
+
+    var pipeline_layout: c.VkPipelineLayout = undefined;
+    try checkResult(c.vkCreatePipelineLayout(self.device, &pipeline_layout_create_info, null, &pipeline_layout));
+
+    self.pipeline_layout = pipeline_layout;
+
+    const pipeline_create_info = c.VkGraphicsPipelineCreateInfo{
+        .sType = c.VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+        .stageCount = 2,
+        .pStages = &shader_stages_create_info[0],
+        .pVertexInputState = &vertex_input_create_info,
+        .pInputAssemblyState = &input_assembly_create_info,
+        .pViewportState = &viewport_state_create_info,
+        .pRasterizationState = &rasterizer_create_info,
+        .pMultisampleState = &multisampling_create_info,
+        .pColorBlendState = &color_blend_create_info,
+        .pDynamicState = &dynamic_state_create_info,
+        .layout = self.pipeline_layout,
+        .renderPass = self.render_pass,
+        .subpass = 0,
+        .basePipelineHandle = @ptrCast(c.VK_NULL_HANDLE),
+    };
+
+    var pipeline: c.VkPipeline = undefined;
+    try checkResult(c.vkCreateGraphicsPipelines(self.device, @ptrCast(c.VK_NULL_HANDLE), 1, &pipeline_create_info, null, &pipeline));
+
+    self.pipeline = pipeline;
+
+    c.vkDestroyShaderModule(self.device, self.fragment_shader, null);
+    c.vkDestroyShaderModule(self.device, self.vertex_shader, null);
 }
 
 fn initVkShaderModule(self: *Self, path: []const u8, module: *c.VkShaderModule) !void {
@@ -99,35 +252,27 @@ fn initVkShaderModule(self: *Self, path: []const u8, module: *c.VkShaderModule) 
 
     const module_create_info = c.VkShaderModuleCreateInfo{
         .sType = c.VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-        .codeSize = file_size * @sizeOf(u32),
-        .pCode = @alignCast(@ptrCast(buffer)),
+        .codeSize = file_size,
+        .pCode = @as([*]const u32, @alignCast(@ptrCast(buffer))),
     };
 
-    var shader_module: c.VkShaderModule = undefined;
-    try checkResult(c.vkCreateShaderModule(self.device, &module_create_info, null, &shader_module));
-
-    module.* = shader_module;
+    try checkResult(c.vkCreateShaderModule(self.device, &module_create_info, null, module));
 }
 
 pub fn deinit(self: Self) void {
-    c.vkDestroySemaphore(self.device, self.render_semaphore, null);
-    c.vkDestroySemaphore(self.device, self.present_semaphore, null);
-    c.vkDestroyFence(self.device, self.fence, null);
-
-    for (self.framebuffers) |framebuffer| {
-        c.vkDestroyFramebuffer(self.device, framebuffer, null);
+    for (self.render_semaphores, self.present_semaphores, self.fences) |render_semaphore, present_semaphore, fence| {
+        c.vkDestroySemaphore(self.device, render_semaphore, null);
+        c.vkDestroySemaphore(self.device, present_semaphore, null);
+        c.vkDestroyFence(self.device, fence, null);
     }
-    self.allocator.free(self.framebuffers);
-
-    c.vkDestroyRenderPass(self.device, self.render_pass, null);
     c.vkDestroyCommandPool(self.device, self.command_pool, null);
 
-    for (self.swapchain_image_views) |image_view| {
-        c.vkDestroyImageView(self.device, image_view, null);
-    }
-    self.allocator.free(self.swapchain_image_views);
+    self.deinitVkSwapchain();
 
-    c.vkDestroySwapchainKHR(self.device, self.swapchain, null);
+    c.vkDestroyPipeline(self.device, self.pipeline, null);
+    c.vkDestroyPipelineLayout(self.device, self.pipeline_layout, null);
+    c.vkDestroyRenderPass(self.device, self.render_pass, null);
+
     c.vkDestroyDevice(self.device, null);
     c.vkDestroySurfaceKHR(self.instance, self.surface, null);
 
@@ -141,33 +286,30 @@ pub fn deinit(self: Self) void {
     }
 }
 
-pub fn drawTriangle(self: Self) void {
-    var result = c.vkWaitForFences(self.device, 1, &self.fence, c.VK_TRUE, 1000000000);
-    if (result != c.VK_SUCCESS) return;
-
-    result = c.vkResetFences(self.device, 1, &self.fence);
-    if (result != c.VK_SUCCESS) return;
+pub fn draw(self: Self) !void {
+    try checkResult(c.vkWaitForFences(self.device, 1, &self.fences[framenumber], c.VK_TRUE, std.math.maxInt(u64)));
+    try checkResult(c.vkResetFences(self.device, 1, &self.fences[framenumber]));
+    std.log.debug("fence reset", .{});
 
     var swapchain_image_index: u32 = 0;
-    result = c.vkAcquireNextImageKHR(self.device, self.swapchain, 1000000000, self.present_semaphore, null, &swapchain_image_index);
-    if (result != c.VK_SUCCESS) return;
+    try checkResult(c.vkAcquireNextImageKHR(self.device, self.swapchain, 100000, self.present_semaphores[framenumber], null, &swapchain_image_index));
 
-    result = c.vkResetCommandBuffer(self.command_buffer, 0);
-    if (result != c.VK_SUCCESS) return;
+    try checkResult(c.vkResetCommandBuffer(self.command_buffers[framenumber], 0));
 
     const cmd_buffer_begin_info = c.VkCommandBufferBeginInfo{
         .sType = c.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-        .flags = c.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
     };
 
-    result = c.vkBeginCommandBuffer(self.command_buffer, &cmd_buffer_begin_info);
-    if (result != c.VK_SUCCESS) return;
+    const clear_color = c.VkClearValue{
+        .color = .{
+            .float32 = .{ 0.0, 0.0, 0.0, 1.0 },
+        },
+    };
 
-    const flash = @abs(@as(f32, @floatFromInt(framenumber)) / 120.0);
-    const clear_value = c.VkClearValue{ .color = .{ .float32 = .{ 0.0, 0.0, flash, 1.0 } } };
     const renderpass_begin_info = c.VkRenderPassBeginInfo{
         .sType = c.VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
         .renderPass = self.render_pass,
+        .framebuffer = self.framebuffers[swapchain_image_index],
         .renderArea = .{
             .offset = .{
                 .x = 0,
@@ -175,42 +317,66 @@ pub fn drawTriangle(self: Self) void {
             },
             .extent = self.extend,
         },
-        .framebuffer = self.framebuffers[swapchain_image_index],
         .clearValueCount = 1,
-        .pClearValues = &clear_value,
+        .pClearValues = &clear_color,
     };
 
-    c.vkCmdBeginRenderPass(self.command_buffer, &renderpass_begin_info, c.VK_SUBPASS_CONTENTS_INLINE);
-    c.vkCmdEndRenderPass(self.command_buffer);
+    const viewport = c.VkViewport{
+        .x = 0.0,
+        .y = 0.0,
+        .width = @floatFromInt(self.extend.width),
+        .height = @floatFromInt(self.extend.height),
+        .minDepth = 0.0,
+        .maxDepth = 1.0,
+    };
 
-    result = c.vkEndCommandBuffer(self.command_buffer);
+    const scissor = c.VkRect2D{
+        .offset = .{ .x = 0, .y = 0 },
+        .extent = self.extend,
+    };
 
-    const stage_flags: c.VkPipelineStageFlags = c.VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    try checkResult(c.vkBeginCommandBuffer(self.command_buffers[framenumber], &cmd_buffer_begin_info));
+
+    c.vkCmdBeginRenderPass(self.command_buffers[framenumber], &renderpass_begin_info, c.VK_SUBPASS_CONTENTS_INLINE);
+    c.vkCmdBindPipeline(self.command_buffers[framenumber], c.VK_PIPELINE_BIND_POINT_GRAPHICS, self.pipeline);
+    c.vkCmdSetViewport(self.command_buffers[framenumber], 0, 1, &viewport);
+    c.vkCmdSetScissor(self.command_buffers[framenumber], 0, 1, &scissor);
+    c.vkCmdDraw(self.command_buffers[framenumber], 3, 1, 0, 0);
+    c.vkCmdEndRenderPass(self.command_buffers[framenumber]);
+
+    try checkResult(c.vkEndCommandBuffer(self.command_buffers[framenumber]));
+
+    const wait_semaphores = [_]c.VkSemaphore{self.present_semaphores[framenumber]};
+    const signal_semaphores = [_]c.VkSemaphore{self.render_semaphores[framenumber]};
+
+    const wait_stages = [_]c.VkPipelineStageFlags{c.VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT};
+
     const submit_info = c.VkSubmitInfo{
         .sType = c.VK_STRUCTURE_TYPE_SUBMIT_INFO,
-        .pWaitDstStageMask = &stage_flags,
-        .waitSemaphoreCount = 1,
-        .pWaitSemaphores = &self.present_semaphore,
-        .signalSemaphoreCount = 1,
-        .pSignalSemaphores = &self.render_semaphore,
+        .waitSemaphoreCount = wait_semaphores.len,
+        .pWaitSemaphores = &wait_semaphores[0],
+        .pWaitDstStageMask = &wait_stages[0],
         .commandBufferCount = 1,
-        .pCommandBuffers = &self.command_buffer,
+        .pCommandBuffers = &self.command_buffers[framenumber],
+        .signalSemaphoreCount = signal_semaphores.len,
+        .pSignalSemaphores = &signal_semaphores[0],
     };
 
-    result = c.vkQueueSubmit(self.graphics_queue, 1, &submit_info, self.fence);
-    if (result != c.VK_SUCCESS) return;
+    try checkResult(c.vkQueueSubmit(self.graphics_queue, 1, &submit_info, self.fences[framenumber]));
 
+    const swapchains = [_]c.VkSwapchainKHR{self.swapchain};
     const present_info = c.VkPresentInfoKHR{
         .sType = c.VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
-        .swapchainCount = 1,
-        .pSwapchains = &self.swapchain,
         .waitSemaphoreCount = 1,
-        .pWaitSemaphores = &self.render_semaphore,
+        .pWaitSemaphores = &signal_semaphores[0],
+        .swapchainCount = 1,
+        .pSwapchains = &swapchains[0],
         .pImageIndices = &swapchain_image_index,
     };
 
-    result = c.vkQueuePresentKHR(self.graphics_queue, &present_info);
-    framenumber += 1;
+    try checkResult(c.vkQueuePresentKHR(self.present_queue, &present_info));
+
+    framenumber = (framenumber + 1) % self.in_flight_frame_count;
 }
 
 fn initVkInstance(self: *Self, params: InitParams) !void {
@@ -262,7 +428,7 @@ fn initVkInstance(self: *Self, params: InitParams) !void {
 }
 
 fn initVkSurface(self: *Self, params: InitParams) !void {
-    try checkResult(vulkan.createSurface(self.instance, &self.surface, params.window));
+    try checkResult(vulkan.createSurface(self.instance, &self.surface, params.window.*));
 }
 
 fn initVkPhysicalDevice(self: *Self) !void {
@@ -462,9 +628,10 @@ fn initVkLogicalDevice(self: *Self) !void {
 
     // for now only graphics queue
     c.vkGetDeviceQueue(self.device, self.graphics_queue_index, 0, &self.graphics_queue);
+    c.vkGetDeviceQueue(self.device, self.present_queue_index, 0, &self.present_queue);
 }
 
-fn initVkSwapChain(self: *Self, params: InitParams) !void {
+fn initVkSwapChain(self: *Self) !void {
 
     // pick format
     var found = false;
@@ -486,8 +653,8 @@ fn initVkSwapChain(self: *Self, params: InitParams) !void {
     }
 
     self.extend = .{
-        .width = std.math.clamp(params.window.width, self.physical_device_surface_capabilities.minImageExtent.width, self.physical_device_surface_capabilities.maxImageExtent.width),
-        .height = std.math.clamp(params.window.height, self.physical_device_surface_capabilities.minImageExtent.height, self.physical_device_surface_capabilities.maxImageExtent.height),
+        .width = std.math.clamp(self.framebuffer_width, self.physical_device_surface_capabilities.minImageExtent.width, self.physical_device_surface_capabilities.maxImageExtent.width),
+        .height = std.math.clamp(self.framebuffer_height, self.physical_device_surface_capabilities.minImageExtent.height, self.physical_device_surface_capabilities.maxImageExtent.height),
     };
 
     const surface_format = self.physical_device_surface_formats[self.physical_device_surface_format];
@@ -559,17 +726,16 @@ fn initVkCommandPool(self: *Self) !void {
 }
 
 fn initVkCommandBuffer(self: *Self) !void {
+    self.command_buffers = try self.allocator.alloc(c.VkCommandBuffer, self.in_flight_frame_count);
+
     const cmd_buffer_create_info = c.VkCommandBufferAllocateInfo{
         .sType = c.VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
         .commandPool = self.command_pool,
-        .commandBufferCount = 1,
+        .commandBufferCount = @intCast(self.command_buffers.len),
         .level = c.VK_COMMAND_BUFFER_LEVEL_PRIMARY,
     };
 
-    var cmd_buffer: c.VkCommandBuffer = undefined;
-    try checkResult(c.vkAllocateCommandBuffers(self.device, &cmd_buffer_create_info, &cmd_buffer));
-
-    self.command_buffer = cmd_buffer;
+    try checkResult(c.vkAllocateCommandBuffers(self.device, &cmd_buffer_create_info, &self.command_buffers[0]));
 }
 
 fn initVkRenderPass(self: *Self) !void {
@@ -589,7 +755,20 @@ fn initVkRenderPass(self: *Self) !void {
         .layout = c.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
     };
 
-    const subpass_description = c.VkSubpassDescription{ .pipelineBindPoint = c.VK_PIPELINE_BIND_POINT_GRAPHICS, .colorAttachmentCount = 1, .pColorAttachments = &color_attachment_ref };
+    const subpass_description = c.VkSubpassDescription{
+        .pipelineBindPoint = c.VK_PIPELINE_BIND_POINT_GRAPHICS,
+        .colorAttachmentCount = 1,
+        .pColorAttachments = &color_attachment_ref,
+    };
+
+    const subpass_dependency = c.VkSubpassDependency{
+        .srcSubpass = c.VK_SUBPASS_EXTERNAL,
+        .dstSubpass = 0,
+        .srcStageMask = c.VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+        .dstStageMask = c.VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+        .srcAccessMask = 0,
+        .dstAccessMask = c.VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+    };
 
     const render_pass_create_info = c.VkRenderPassCreateInfo{
         .sType = c.VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
@@ -597,6 +776,8 @@ fn initVkRenderPass(self: *Self) !void {
         .pAttachments = &color_attachment,
         .subpassCount = 1,
         .pSubpasses = &subpass_description,
+        .dependencyCount = 1,
+        .pDependencies = &subpass_dependency,
     };
 
     var render_pass: c.VkRenderPass = undefined;
@@ -619,30 +800,25 @@ fn initVkFrameBuffers(self: *Self) !void {
     self.framebuffers = framebuffers;
 }
 
-fn initVkFence(self: *Self) !void {
+fn initVkSemaphoresAndFences(self: *Self) !void {
     const fence_create_info = c.VkFenceCreateInfo{
         .sType = c.VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
         .flags = c.VK_FENCE_CREATE_SIGNALED_BIT,
     };
 
-    var fence: c.VkFence = undefined;
-    try checkResult(c.vkCreateFence(self.device, &fence_create_info, null, &fence));
-
-    self.fence = fence;
-}
-
-fn initVkSemaphores(self: *Self) !void {
     const semaphore_create_info = c.VkSemaphoreCreateInfo{
         .sType = c.VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
-        .flags = 0,
     };
 
-    var semaphore: c.VkSemaphore = undefined;
-    try checkResult(c.vkCreateSemaphore(self.device, &semaphore_create_info, null, &semaphore));
-    self.render_semaphore = semaphore;
+    self.fences = try self.allocator.alloc(c.VkFence, self.in_flight_frame_count);
+    self.render_semaphores = try self.allocator.alloc(c.VkSemaphore, self.in_flight_frame_count);
+    self.present_semaphores = try self.allocator.alloc(c.VkSemaphore, self.in_flight_frame_count);
 
-    try checkResult(c.vkCreateSemaphore(self.device, &semaphore_create_info, null, &semaphore));
-    self.present_semaphore = semaphore;
+    for (self.render_semaphores, self.present_semaphores, self.fences) |*render_semaphore, *present_semaphore, *fence| {
+        try checkResult(c.vkCreateSemaphore(self.device, &semaphore_create_info, null, render_semaphore));
+        try checkResult(c.vkCreateSemaphore(self.device, &semaphore_create_info, null, present_semaphore));
+        try checkResult(c.vkCreateFence(self.device, &fence_create_info, null, fence));
+    }
 }
 
 fn initVkDebugMessenger(self: *Self) !void {
@@ -701,15 +877,8 @@ fn debugCallback(severity: c.VkDebugUtilsMessageSeverityFlagBitsEXT, msg_type: c
 
 fn getRequiredInstanceExtensions() []const [*c]const u8 {
     comptime var extensions: []const [*c]const u8 = &.{c.VK_KHR_SURFACE_EXTENSION_NAME};
-    switch (builtin.os.tag) {
-        .windows => {
-            extensions = extensions ++ .{c.VK_KHR_WIN32_SURFACE_EXTENSION_NAME};
-        },
-        .linux => {
-            extensions = extensions ++ .{c.VK_KHR_XCB_SURFACE_EXTENSION_NAME};
-        },
-        else => return error.PlatformNotSupported,
-    }
+
+    extensions = extensions ++ vulkan.platform_instance_extensions;
 
     switch (builtin.mode) {
         .Debug => {
