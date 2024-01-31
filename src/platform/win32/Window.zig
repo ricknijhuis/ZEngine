@@ -5,55 +5,71 @@ const c = @cImport({
     @cInclude("windows.h");
 });
 
+const HWND = *opaque {};
+const HWND_TOPMOST = typedConst(HWND, @as(i32, -1));
+
+extern fn SetWindowPos(
+    hWnd: c.HWND,
+    hWndInsertAfter: HWND,
+    x: c_int,
+    y: c_int,
+    cx: c_int,
+    cy: c_int,
+    flags: c.UINT,
+) callconv(std.os.windows.WINAPI) c.BOOL;
+
 const utf8ToUtf16Lit = std.unicode.utf8ToUtf16LeStringLiteral;
 const utf8ToUtf16 = std.unicode.utf8ToUtf16LeWithNull;
-const atom_name = utf8ToUtf16Lit("TarkovV2");
-
-const Application = @import("../../Application.zig");
+const window = @import("../window_internal.zig");
+const engine = @import("../../root.zig");
 
 const Self = @This();
 
-pub const Mode = enum(i32) {
-    windowed,
-    borderless,
-    fullscreen,
+pub const Mode = window.Mode;
+pub const Extend = window.Extend;
+pub const InitParams = window.InitParams;
+
+const WindowProperties = struct {
+    instance: c.HINSTANCE,
+    hwnd: c.HWND,
+    application: *engine.Application,
+    extend: Extend,
+    mode: Mode,
+    close_event_writer: engine.WindowCloseEventQueue.Writer,
+    resize_event_writer: engine.WindowResizeEventQueue.Writer,
+    minimize_event_writer: engine.WindowMinEventQueue.Writer,
+    maximize_event_writer: engine.WindowMaxEventQueue.Writer,
 };
 
-pub const InitParams = struct {
-    allocator: std.mem.Allocator,
-    application: *Application,
-    mode: Mode = Mode.fullscreen,
-    width: u32,
-    height: u32,
-};
-
-const WindowProp = struct {
-    application: *Application,
-};
+const atom_name = utf8ToUtf16Lit("SurvivalConcept");
 
 allocator: std.mem.Allocator,
-handle: c.HWND,
-instance: c.HINSTANCE,
-width: u32,
-height: u32,
+properties: *WindowProperties,
 
-pub fn init(
-    params: InitParams,
-) !Self {
+pub fn init(params: InitParams) !Self {
     var self = Self{
         .allocator = params.allocator,
-        .handle = undefined,
-        .instance = c.GetModuleHandleW(null),
-        .width = params.width,
-        .height = params.height,
+        .properties = undefined,
     };
+
+    self.properties = try self.allocator.create(@TypeOf(self.properties.*));
+    self.properties.instance = c.GetModuleHandleW(null);
+    self.properties.hwnd = null;
+    self.properties.application = params.application;
+    self.properties.extend = params.extend;
+    self.properties.mode = params.mode;
+    self.properties.close_event_writer = params.close_event_writer;
+    self.properties.resize_event_writer = params.resize_event_writer;
+    self.properties.minimize_event_writer = params.minimize_event_writer;
+    self.properties.maximize_event_writer = params.maximize_event_writer;
+
     const class = c.WNDCLASSEXW{
         .cbSize = @sizeOf(c.WNDCLASSEXW),
         .cbClsExtra = 0,
         .cbWndExtra = 0,
         .style = c.CS_HREDRAW | c.CS_VREDRAW | c.CS_OWNDC,
         .lpfnWndProc = windowProcedure,
-        .hInstance = self.instance,
+        .hInstance = self.properties.instance,
         .hCursor = null,
         .hIcon = null,
         .lpszClassName = atom_name,
@@ -61,7 +77,8 @@ pub fn init(
         .hbrBackground = null,
         .hIconSm = null,
     };
-    _ = c.RegisterClassExW(&class);
+
+    try checkResult(c.RegisterClassExW(&class) != 0);
 
     const title = try utf8ToUtf16(self.allocator, params.application.title);
     defer params.allocator.free(title);
@@ -69,66 +86,55 @@ pub fn init(
     const style = getWindowStyle(params.mode);
     const style_ex = getWindowStyleEx(params.mode);
 
-    var position = c.RECT{
-        .left = 0,
-        .top = 0,
-        .right = @intCast(params.width),
-        .bottom = @intCast(params.height),
-    };
+    var window_rect = try getPrimaryMonitorRect();
+    const monitor_width = window_rect.right - window_rect.left;
+    const monitor_height = window_rect.bottom - window_rect.top;
+    const width = @as(c_long, @intCast(self.properties.extend.width));
+    const height = @as(c_long, @intCast(self.properties.extend.height));
+    const denominator: c_long = 2;
 
-    if (params.mode == Mode.fullscreen) {
-        if (getPrimaryMonitorRect()) |rect| {
-            position = rect;
-        }
+    if (self.properties.mode == Mode.windowed) {
+        window_rect.left = @divExact(monitor_width, denominator) - @divExact(width, denominator);
+        window_rect.top = @divExact(monitor_height, denominator) - @divExact(height, denominator);
+        window_rect.right = window_rect.left + width;
+        window_rect.bottom = window_rect.top + height;
+
+        try checkResult(c.AdjustWindowRectEx(&window_rect, style, c.FALSE, style_ex) == c.TRUE);
     }
 
-    self.width = @intCast(position.right - position.left);
-    self.height = @intCast(position.bottom - position.top);
+    std.log.debug("x: {}, y: {}, width: {}, height: {}", .{ window_rect.left, window_rect.top, window_rect.right - window_rect.left, window_rect.bottom - window_rect.top });
 
-    self.handle = c.CreateWindowExW(
+    self.properties.hwnd = c.CreateWindowExW(
         style_ex,
         atom_name,
         title,
         style,
-        position.left,
-        position.top,
-        position.right - position.left,
-        position.bottom - position.top,
+        window_rect.left,
+        window_rect.top,
+        window_rect.right - window_rect.left,
+        window_rect.bottom - window_rect.top,
         null,
         null,
-        self.instance,
+        self.properties.instance,
         null,
     );
 
-    const prop: *WindowProp = try self.allocator.create(WindowProp);
+    try checkResult(self.properties.hwnd != null);
+    try checkResult(c.SetPropW(self.properties.hwnd, atom_name, self.properties) != 0);
 
-    prop.application = params.application;
-
-    _ = c.SetPropW(self.handle, atom_name, prop);
-    _ = c.ShowWindow(self.handle, c.SW_SHOWNA);
-    _ = c.BringWindowToTop(self.handle);
-    _ = c.SetForegroundWindow(self.handle);
-    _ = c.SetFocus(self.handle);
-
-    var rawInputDevice = c.RAWINPUTDEVICE{ .dwFlags = 0, .hwndTarget = 0, .usUsage = 0x06, .usUsagePage = 0x01 };
-    rawInputDevice.usUsagePage = 0x01;
-    rawInputDevice.usUsage = 0x06;
-    rawInputDevice.dwFlags = 0;
-    rawInputDevice.hwndTarget = 0;
-    _ = c.RegisterRawInputDevices(&rawInputDevice, 1, @sizeOf(@TypeOf(rawInputDevice)));
+    _ = c.ShowWindow(self.properties.hwnd, c.SW_SHOWNA);
+    _ = c.BringWindowToTop(self.properties.hwnd);
+    _ = c.SetForegroundWindow(self.properties.hwnd);
+    _ = c.SetFocus(self.properties.hwnd);
 
     return self;
 }
 
 pub fn deinit(self: Self) void {
-    if (c.GetPropW(self.handle, atom_name)) |prop| {
-        self.allocator.destroy(@as(*WindowProp, @alignCast(@ptrCast(prop))));
-    }
-
-    _ = c.DestroyWindow(self.handle);
+    _ = self; // autofix
 }
 
-pub fn pollEvents(self: *const Self) void {
+pub fn pollEvents(self: Self) void {
     _ = self;
     var msg: c.MSG = undefined;
     while (c.PeekMessageW(&msg, null, 0, 0, c.PM_REMOVE) != 0) {
@@ -141,7 +147,27 @@ pub fn pollEvents(self: *const Self) void {
     }
 }
 
-fn getPrimaryMonitorRect() ?c.RECT {
+pub fn getSize(self: Self) Extend {
+    var rect: c.RECT = undefined;
+    _ = c.GetClientRect(self.properties.hwnd, &rect);
+
+    return Extend{
+        .width = @intCast(rect.right - rect.left),
+        .height = @intCast(rect.bottom - rect.top),
+    };
+}
+
+pub fn setSize(self: Self) void {
+    _ = self; // autofix
+
+}
+
+pub fn setMode(self: Self, mode: Mode) !void {
+    _ = self; // autofix
+    _ = mode; // autofix
+}
+
+fn getPrimaryMonitorRect() !c.RECT {
     const ptZero = c.POINT{ .x = 0, .y = 0 };
     const monitor = c.MonitorFromPoint(ptZero, c.MONITOR_DEFAULTTONEAREST);
     var monitor_info = c.MONITORINFO{
@@ -150,63 +176,55 @@ fn getPrimaryMonitorRect() ?c.RECT {
         .rcMonitor = undefined,
         .rcWork = undefined,
     };
-    if (c.GetMonitorInfoW(monitor, &monitor_info) != 0) {
-        return monitor_info.rcMonitor;
-    }
-    return null;
+
+    try checkResult(c.GetMonitorInfoW(monitor, &monitor_info) != 0);
+
+    return monitor_info.rcMonitor;
 }
 
-fn getWindowStyle(mode: Mode) c_ulong {
-    switch (mode) {
-        .windowed => {
-            return c.WS_CLIPSIBLINGS | c.WS_CLIPCHILDREN | c.WS_OVERLAPPED;
-        },
-        .borderless => {
-            return c.WS_CLIPSIBLINGS | c.WS_CLIPCHILDREN | c.WS_SYSMENU | c.WS_MINIMIZE | c.WS_POPUP;
-        },
-        .fullscreen => {
-            return c.WS_CLIPSIBLINGS | c.WS_CLIPCHILDREN | c.WS_OVERLAPPED | c.WS_POPUP;
-        },
-    }
-    return 0;
-}
-
-fn getWindowStyleEx(mode: Mode) c_ulong {
-    if (mode == Mode.fullscreen or mode == Mode.borderless) {
-        return c.WS_EX_APPWINDOW | c.WS_EX_TOPMOST;
-    } else {
-        return c.WS_EX_APPWINDOW;
-    }
-    return 0;
+fn fitToMonitor(self: Self) !void {
+    const rect = try getPrimaryMonitorRect();
+    try checkResult(SetWindowPos(
+        self.properties.hwnd,
+        HWND_TOPMOST,
+        rect.left,
+        rect.top,
+        rect.right - rect.left,
+        rect.bottom - rect.top,
+        c.SWP_NOZORDER | c.SWP_NOACTIVATE | c.SWP_NOCOPYBITS,
+    ) == c.TRUE);
 }
 
 fn windowProcedure(hwnd: c.HWND, uMsg: u32, wParam: c.WPARAM, lParam: c.LPARAM) callconv(.C) isize {
-    var window_prop: *WindowProp = undefined;
+    var window_prop: *WindowProperties = undefined;
 
     if (c.GetPropW(hwnd, atom_name)) |prop| {
         window_prop = @ptrCast(@alignCast(prop));
     } else return c.DefWindowProcW(hwnd, uMsg, wParam, lParam);
 
-    var input: c.RAWINPUT = .{};
-    var input_size: c_uint = @sizeOf(@TypeOf(input));
-
     switch (uMsg) {
         c.WM_SIZE => {
-            //engine.window.fitToCurrentMonitor() catch unreachable;
+            const width: u32 = @intCast(lParam & 0xFFFF);
+            const height: u32 = @intCast((lParam >> 16) & 0xFFFF);
+            window_prop.resize_event_writer.send(.{
+                .width = width,
+                .height = height,
+            }) catch return 0;
             return 0;
         },
         c.WM_SETFOCUS => {
-            return 0;
+            return c.DefWindowProcW(hwnd, uMsg, wParam, lParam);
         },
         c.WM_KILLFOCUS => {
-            //engine.window.minimize();
-            return 0;
+            return c.DefWindowProcW(hwnd, uMsg, wParam, lParam);
         },
         c.WM_CLOSE => {
-            //engine.is_running = false;
-            return 0;
+            window_prop.close_event_writer.send(.{}) catch return 0;
+            return c.DefWindowProcW(hwnd, uMsg, wParam, lParam);
         },
         c.WM_INPUT => {
+            var input: c.RAWINPUT = .{};
+            var input_size: c_uint = @sizeOf(@TypeOf(input));
             _ = c.GetRawInputData(lParam, c.RID_INPUT, &input, &input_size, @as(c_uint, @sizeOf(c.RAWINPUTHEADER)));
 
             if (input.header.dwType == c.RIM_TYPEKEYBOARD) {
@@ -238,5 +256,92 @@ fn windowProcedure(hwnd: c.HWND, uMsg: u32, wParam: c.WPARAM, lParam: c.LPARAM) 
         else => {
             return c.DefWindowProcW(hwnd, uMsg, wParam, lParam);
         },
+    }
+}
+
+fn getWindowStyle(mode: Mode) c_ulong {
+    switch (mode) {
+        .windowed => {
+            return c.WS_CLIPSIBLINGS | c.WS_CLIPCHILDREN | c.WS_SYSMENU | c.WS_THICKFRAME | c.WS_OVERLAPPED;
+        },
+        .borderless, .fullscreen => {
+            return c.WS_POPUP;
+        },
+    }
+    return 0;
+}
+
+fn getWindowStyleEx(mode: Mode) c_ulong {
+    if (mode == Mode.fullscreen or mode == Mode.borderless) {
+        return c.WS_EX_APPWINDOW | c.WS_EX_TOPMOST;
+    } else {
+        return c.WS_EX_APPWINDOW;
+    }
+    return 0;
+}
+
+fn checkResult(ok: bool) std.os.UnexpectedError!void {
+    if (ok) return;
+
+    const err = c.GetLastError();
+    if (std.os.unexpected_error_tracing) {
+        // 614 is the length of the longest windows error description
+        var buf_wstr: [614:0]u16 = undefined;
+        var buf_utf8: [614:0]u8 = undefined;
+        const len = c.FormatMessageW(
+            c.FORMAT_MESSAGE_FROM_SYSTEM | c.FORMAT_MESSAGE_IGNORE_INSERTS,
+            null,
+            err,
+            c.MAKELANGID(c.LANG_NEUTRAL, c.SUBLANG_DEFAULT),
+            &buf_wstr,
+            buf_wstr.len,
+            null,
+        );
+        _ = std.unicode.utf16leToUtf8(&buf_utf8, buf_wstr[0..len]) catch unreachable;
+        std.debug.print("error.Unexpected: GetLastError({}): {s}\n", .{ err, buf_utf8[0..len] });
+        std.debug.dumpCurrentStackTrace(@returnAddress());
+    }
+    return error.Unexpected;
+}
+
+pub fn typedConst(comptime T: type, comptime value: anytype) T {
+    return typedConst2(T, T, value);
+}
+
+pub fn typedConst2(comptime ReturnType: type, comptime SwitchType: type, comptime value: anytype) ReturnType {
+    const target_type_error = @as([]const u8, "typedConst cannot convert to " ++ @typeName(ReturnType));
+    const value_type_error = @as([]const u8, "typedConst cannot convert " ++ @typeName(@TypeOf(value)) ++ " to " ++ @typeName(ReturnType));
+
+    switch (@typeInfo(SwitchType)) {
+        .Int => |target_type_info| {
+            if (value >= std.math.maxInt(SwitchType)) {
+                if (target_type_info.signedness == .signed) {
+                    const UnsignedT = @Type(std.builtin.Type{ .Int = .{ .signedness = .unsigned, .bits = target_type_info.bits } });
+                    return @as(SwitchType, @bitCast(@as(UnsignedT, value)));
+                }
+            }
+            return value;
+        },
+        .Pointer => |target_type_info| switch (target_type_info.size) {
+            .One, .Many, .C => {
+                switch (@typeInfo(@TypeOf(value))) {
+                    .ComptimeInt, .Int => {
+                        const usize_value = if (value >= 0) value else @as(usize, @bitCast(@as(isize, value)));
+                        return @as(ReturnType, @ptrFromInt(usize_value));
+                    },
+                    else => @compileError(value_type_error),
+                }
+            },
+            else => target_type_error,
+        },
+        .Optional => |target_type_info| switch (@typeInfo(target_type_info.child)) {
+            .Pointer => return typedConst2(ReturnType, target_type_info.child, value),
+            else => target_type_error,
+        },
+        .Enum => |_| switch (@typeInfo(@TypeOf(value))) {
+            .Int => return @as(ReturnType, @enumFromInt(value)),
+            else => target_type_error,
+        },
+        else => @compileError(target_type_error),
     }
 }

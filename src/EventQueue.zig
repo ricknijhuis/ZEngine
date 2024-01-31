@@ -43,34 +43,34 @@ pub fn EventQueue(comptime T: type) type {
         }
 
         pub fn getWriter(self: *Self) Writer {
-            return .{ .system = self };
+            return .{ .queue = self };
         }
 
         pub fn getReader(self: *Self) Reader {
-            return .{ .system = self, .position = 0 };
+            return .{ .queue = self, .position = 0 };
         }
 
         pub const Writer = struct {
             const WriterSelf = @This();
 
-            system: *Self,
+            queue: *Self,
 
             pub fn send(self: *WriterSelf, event: T) !void {
-                self.system.mutex.lock();
-                defer self.system.mutex.unlock();
+                self.queue.mutex.lock();
+                defer self.queue.mutex.unlock();
 
-                try self.system.buffers[@as(usize, @intFromBool(self.system.current_buffer))].append(event);
+                try self.queue.buffers[@as(usize, @intFromBool(self.queue.current_buffer))].append(event);
             }
         };
 
         pub const Reader = struct {
             const ReaderSelf = @This();
 
-            system: *Self,
+            queue: *Self,
             position: usize,
 
             pub fn receive(self: *ReaderSelf) ?T {
-                const buffer = self.system.buffers[@as(usize, @intFromBool(!self.system.current_buffer))];
+                const buffer = self.queue.buffers[@as(usize, @intFromBool(!self.queue.current_buffer))];
                 if (self.position < buffer.items.len) {
                     const value = buffer.items[self.position];
                     self.position += 1;
@@ -83,7 +83,7 @@ pub fn EventQueue(comptime T: type) type {
     };
 }
 
-test "event system can init to valid state" {
+test "event queue can init to valid state" {
     const Event = struct {
         id: i32,
     };
@@ -98,7 +98,7 @@ test "event system can init to valid state" {
     try std.testing.expectEqual(event_queue.current_buffer, false);
 }
 
-test "event system writer can send events less than given capacity" {
+test "event queue writer can send events less than given capacity" {
     const Event = struct {
         id: i32,
     };
@@ -112,7 +112,7 @@ test "event system writer can send events less than given capacity" {
     try event_writer.send(Event{ .id = 2 });
 }
 
-test "event system reader cannot read events before swap" {
+test "event queue reader cannot read events before swap" {
     const Event = struct {
         id: i32,
     };
@@ -130,7 +130,7 @@ test "event system reader cannot read events before swap" {
     try std.testing.expect(event_reader.receive() == null);
 }
 
-test "event system reader can read events after swap" {
+test "event queue reader can read events after swap" {
     const Event = struct {
         id: i32,
     };
@@ -154,7 +154,7 @@ test "event system reader can read events after swap" {
     }
 }
 
-test "event system reader can read all messages and returns null at last" {
+test "event queue reader can read all messages and returns null at last" {
     const Event = struct {
         id: i32,
     };
