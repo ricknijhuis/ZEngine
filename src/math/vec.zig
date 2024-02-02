@@ -4,9 +4,8 @@ pub fn Vec(comptime Scalar: type, dimensions: u32) type {
     return extern struct {
         vec: @Vector(dimensions, Scalar),
 
-        pub const n = n;
-
         const Self = @This();
+        const VecT = @Vector(dimensions, Scalar);
 
         pub usingnamespace switch (dimensions) {
             inline 2 => struct {
@@ -95,6 +94,10 @@ pub fn Vec(comptime Scalar: type, dimensions: u32) type {
 
         pub inline fn dot(self: Self, other: Self) Scalar {
             return @reduce(.Add, self.mul(other).vec);
+        }
+
+        pub inline fn mulScalar(self: Self, scalar: Scalar) Self {
+            return .{ .vec = self.vec * @as(VecT, @splat(scalar)) };
         }
 
         pub inline fn cross(self: Self, other: Self) Self {
@@ -404,28 +407,29 @@ test "Get scalar projection" {
     const b = Vec2F.init(2.0, 4.0);
 
     const a_normalized = a.normalize();
-    const scalar = a_normalized.dot(b);
+    const result = a_normalized.dot(b);
 
-    try testing.expectEqual(scalar, 4.242640687119285);
+    try testing.expectEqual(result, 4.242640687119285);
 }
 
-test "Get scalar projection" {
+test "Get vector projection" {
     // a = (x = 1.0, y = 1.0)
     // b = (x = 2.0, y = 4.0)
     //          y
+    //          |    b
     //          |
-    //          |       b
     //          | a
     //  --------|--------- x
     //          |
     //          |
     //          |
     const testing = std.testing;
-    const a = Vec2F.init(0.0, 1.0);
-    const b = Vec2F.init(4.0, 0.0);
+    const a = Vec2F.init(1.0, 1.0);
+    const b = Vec2F.init(2.0, 4.0);
 
     const a_normalized = a.normalize();
-    const scalar = a_normalized.dot(b);
-
-    try testing.expectEqual(scalar, 4.242640687119285);
+    const scalar_projection = a_normalized.dot(b);
+    const result = a_normalized.mul(Vec2F.splat(scalar_projection));
+    try testing.expectEqual(result.x(), 2.99999976e+00);
+    try testing.expectEqual(result.y(), 2.99999976e+00);
 }

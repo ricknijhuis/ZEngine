@@ -16,3 +16,7 @@ pub const WindowResizeEvent = events.WindowResizeEvent;
 pub const WindowMaximizeEvent = events.WindowMaximizeEvent;
 pub const WindowMinimizeEvent = events.WindowMinimizeEvent;
 pub const WindowCloseEvent = events.WindowCloseEvent;
+
+test {
+    @import("std").testing.refAllDecls(@This());
+}
