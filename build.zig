@@ -19,7 +19,7 @@ pub fn build(b: *std.Build) void {
     const exe = addSandboxExe(engine, b, target, optimize);
     _ = exe; // autofix
 
-    addBuildAssetsSteps(b);
+    //addBuildAssetsSteps(b);
 
     // Creates a step for unit testing. This only builds the test executable
     // but does not run it.
@@ -79,7 +79,7 @@ fn addZEngineModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: s
         .optimize = optimize,
     });
 
-    if (b.env_map.get("VK_SDK_PATH")) |path| {
+    if (b.graph.env_map.get("VK_SDK_PATH")) |path| {
         module.addLibraryPath(.{ .cwd_relative = std.fmt.allocPrint(b.allocator, "{s}/lib", .{path}) catch @panic("OOM") });
         module.addIncludePath(.{ .cwd_relative = std.fmt.allocPrint(b.allocator, "{s}/include", .{path}) catch @panic("OOM") });
     } else {

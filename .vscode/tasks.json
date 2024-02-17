@@ -1,0 +1,33 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "build",
+            "type": "shell",
+            "command": "zig build",
+            "group": "build",
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "build test",
+            "type": "shell",
+            "command": "zig test -femit-bin='zig-out/bin/test.exe' --test-no-exec ${input:testFile} -lc",
+            "group": "build",
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": []
+        }
+    ],
+    "inputs": [
+        {
+          "type": "promptString",
+          "id": "testFile",
+          "description": "Specific file to test",
+          "default": "src/root.zig"
+        }
+    ]
+}
